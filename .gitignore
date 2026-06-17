@@ -1,0 +1,41 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## NuGet
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+*.nupkg
+**/[Nn]u[Gg]et.config
+
+## Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+
+## Visual Studio
+.vs/
+*.rsuser
+*.sln.docstates
+
+## Rider
+.idea/
+
+## User-specific files
+*.user
+*.suo
+
+## OS generated
+.DS_Store
+Thumbs.db
+
+## Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan

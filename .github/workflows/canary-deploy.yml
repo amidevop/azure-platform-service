@@ -1,0 +1,281 @@
+name: Canary Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (dev or prod)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      image_tag:
+        description: 'Container image tag (commit SHA) to deploy'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+  statuses: write
+
+env:
+  CANARY_TRAFFIC_PERCENT: 10
+  STABLE_TRAFFIC_PERCENT: 90
+  MONITOR_INTERVAL_SECONDS: 30
+  ERROR_RATE_THRESHOLD: 5
+  P95_LATENCY_MULTIPLIER: 2
+  PROMOTION_WINDOW_MINUTES: 10
+  EVALUATION_WINDOW_MINUTES: 3
+  MIN_REQUESTS_THRESHOLD: 50
+
+jobs:
+  canary-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set environment variables
+        id: env
+        run: |
+          ENV="${{ inputs.environment }}"
+          echo "environment=$ENV" >> "$GITHUB_OUTPUT"
+          echo "resource_group=rg-azplat-${ENV}" >> "$GITHUB_OUTPUT"
+          echo "api_app=ca-azplat-api-${ENV}" >> "$GITHUB_OUTPUT"
+          echo "worker_app=ca-azplat-worker-${ENV}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get current stable revision
+        id: stable
+        run: |
+          STABLE_REVISION=$(az containerapp revision list \
+            --name ${{ steps.env.outputs.api_app }} \
+            --resource-group ${{ steps.env.outputs.resource_group }} \
+            --query "[?properties.trafficWeight>=\`90\`].name | [0]" \
+            --output tsv)
+          echo "revision=$STABLE_REVISION" >> "$GITHUB_OUTPUT"
+          echo "Stable revision: $STABLE_REVISION"
+
+      - name: Deploy canary revision
+        id: canary
+        run: |
+          CANARY_SUFFIX="canary-${GITHUB_SHA:0:8}"
+          az containerapp update \
+            --name ${{ steps.env.outputs.api_app }} \
+            --resource-group ${{ steps.env.outputs.resource_group }} \
+            --image ${{ secrets.ACR_LOGIN_SERVER }}/api:${{ inputs.image_tag }} \
+            --revision-suffix "$CANARY_SUFFIX" \
+            --set-env-vars "DEPLOYMENT_SHA=${{ inputs.image_tag }}" "CANARY=true"
+
+          CANARY_REVISION="${{ steps.env.outputs.api_app }}--${CANARY_SUFFIX}"
+          echo "revision=$CANARY_REVISION" >> "$GITHUB_OUTPUT"
+          echo "Canary revision: $CANARY_REVISION"
+
+      - name: Route 10% traffic to canary
+        run: |
+          az containerapp ingress traffic set \
+            --name ${{ steps.env.outputs.api_app }} \
+            --resource-group ${{ steps.env.outputs.resource_group }} \
+            --revision-weight \
+              "${{ steps.stable.outputs.revision }}=${{ env.STABLE_TRAFFIC_PERCENT }}" \
+              "${{ steps.canary.outputs.revision }}=${{ env.CANARY_TRAFFIC_PERCENT }}"
+          
+          echo "Traffic split: ${{ env.STABLE_TRAFFIC_PERCENT }}% stable, ${{ env.CANARY_TRAFFIC_PERCENT }}% canary"
+
+      - name: Monitor canary metrics
+        id: monitor
+        env:
+          APP_INSIGHTS_APP_ID: ${{ secrets.APP_INSIGHTS_APP_ID }}
+          APP_INSIGHTS_API_KEY: ${{ secrets.APP_INSIGHTS_API_KEY }}
+        run: |
+          CANARY_REVISION="${{ steps.canary.outputs.revision }}"
+          STABLE_REVISION="${{ steps.stable.outputs.revision }}"
+          API_APP="${{ steps.env.outputs.api_app }}"
+          RG="${{ steps.env.outputs.resource_group }}"
+          
+          PROMOTION_WINDOW=${{ env.PROMOTION_WINDOW_MINUTES }}
+          EVAL_WINDOW=${{ env.EVALUATION_WINDOW_MINUTES }}
+          MONITOR_INTERVAL=${{ env.MONITOR_INTERVAL_SECONDS }}
+          ERROR_THRESHOLD=${{ env.ERROR_RATE_THRESHOLD }}
+          P95_MULTIPLIER=${{ env.P95_LATENCY_MULTIPLIER }}
+          MIN_REQUESTS=${{ env.MIN_REQUESTS_THRESHOLD }}
+          
+          CONTINUOUS_HEALTHY_SECONDS=0
+          REQUIRED_HEALTHY_SECONDS=$((PROMOTION_WINDOW * 60))
+          
+          echo "Starting canary monitoring..."
+          echo "Promotion requires ${PROMOTION_WINDOW}min continuous healthy metrics"
+          echo "Rollback if error rate > ${ERROR_THRESHOLD}% over ${EVAL_WINDOW}min with >= ${MIN_REQUESTS} requests"
+          
+          while true; do
+            sleep "$MONITOR_INTERVAL"
+            
+            # Query canary revision metrics from Application Insights
+            # Error rate for canary revision over evaluation window
+            CANARY_METRICS=$(az monitor app-insights metrics show \
+              --app "$APP_INSIGHTS_APP_ID" \
+              --metrics "requests/count" \
+              --filter "cloud/roleInstance eq '${CANARY_REVISION}'" \
+              --interval "PT${EVAL_WINDOW}M" \
+              --output json 2>/dev/null || echo '{}')
+            
+            CANARY_TOTAL=$(echo "$CANARY_METRICS" | jq -r '.value."requests/count".sum // 0')
+            
+            # Query failed requests for canary
+            CANARY_FAILED_METRICS=$(az monitor app-insights metrics show \
+              --app "$APP_INSIGHTS_APP_ID" \
+              --metrics "requests/failed" \
+              --filter "cloud/roleInstance eq '${CANARY_REVISION}'" \
+              --interval "PT${EVAL_WINDOW}M" \
+              --output json 2>/dev/null || echo '{}')
+            
+            CANARY_FAILED=$(echo "$CANARY_FAILED_METRICS" | jq -r '.value."requests/failed".sum // 0')
+            
+            # Query p95 latency for canary
+            CANARY_P95_METRICS=$(az monitor app-insights metrics show \
+              --app "$APP_INSIGHTS_APP_ID" \
+              --metrics "requests/duration" \
+              --filter "cloud/roleInstance eq '${CANARY_REVISION}'" \
+              --interval "PT${EVAL_WINDOW}M" \
+              --aggregation "P95" \
+              --output json 2>/dev/null || echo '{}')
+            
+            CANARY_P95=$(echo "$CANARY_P95_METRICS" | jq -r '.value."requests/duration".P95 // 0')
+            
+            # Query p95 latency for stable
+            STABLE_P95_METRICS=$(az monitor app-insights metrics show \
+              --app "$APP_INSIGHTS_APP_ID" \
+              --metrics "requests/duration" \
+              --filter "cloud/roleInstance eq '${STABLE_REVISION}'" \
+              --interval "PT${EVAL_WINDOW}M" \
+              --aggregation "P95" \
+              --output json 2>/dev/null || echo '{}')
+            
+            STABLE_P95=$(echo "$STABLE_P95_METRICS" | jq -r '.value."requests/duration".P95 // 0')
+            
+            echo "---"
+            echo "Canary total requests: $CANARY_TOTAL, failed: $CANARY_FAILED"
+            echo "Canary p95: ${CANARY_P95}ms, Stable p95: ${STABLE_P95}ms"
+            
+            # Check minimum request threshold
+            if [ "$(echo "$CANARY_TOTAL < $MIN_REQUESTS" | bc -l)" -eq 1 ]; then
+              echo "Insufficient requests ($CANARY_TOTAL < $MIN_REQUESTS) - extending evaluation window"
+              # Reset healthy counter when insufficient data
+              CONTINUOUS_HEALTHY_SECONDS=0
+              continue
+            fi
+            
+            # Calculate error rate
+            if [ "$(echo "$CANARY_TOTAL > 0" | bc -l)" -eq 1 ]; then
+              ERROR_RATE=$(echo "scale=2; ($CANARY_FAILED / $CANARY_TOTAL) * 100" | bc -l)
+            else
+              ERROR_RATE=0
+            fi
+            
+            echo "Canary error rate: ${ERROR_RATE}%"
+            
+            # Check rollback condition: error rate > threshold
+            if [ "$(echo "$ERROR_RATE > $ERROR_THRESHOLD" | bc -l)" -eq 1 ]; then
+              echo "ERROR: Canary error rate ${ERROR_RATE}% exceeds threshold ${ERROR_THRESHOLD}%"
+              echo "decision=rollback" >> "$GITHUB_OUTPUT"
+              echo "reason=Error rate ${ERROR_RATE}% exceeded ${ERROR_THRESHOLD}% threshold over ${EVAL_WINDOW}min window" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            
+            # Check p95 latency condition
+            P95_LIMIT=$(echo "scale=2; $STABLE_P95 * $P95_MULTIPLIER" | bc -l)
+            if [ "$(echo "$STABLE_P95 > 0" | bc -l)" -eq 1 ] && [ "$(echo "$CANARY_P95 > $P95_LIMIT" | bc -l)" -eq 1 ]; then
+              echo "WARNING: Canary p95 (${CANARY_P95}ms) exceeds ${P95_MULTIPLIER}x stable p95 (${STABLE_P95}ms = limit ${P95_LIMIT}ms)"
+              CONTINUOUS_HEALTHY_SECONDS=0
+              continue
+            fi
+            
+            # Metrics are healthy - increment continuous healthy time
+            CONTINUOUS_HEALTHY_SECONDS=$((CONTINUOUS_HEALTHY_SECONDS + MONITOR_INTERVAL))
+            echo "Continuous healthy: ${CONTINUOUS_HEALTHY_SECONDS}s / ${REQUIRED_HEALTHY_SECONDS}s"
+            
+            # Check promotion condition
+            if [ $CONTINUOUS_HEALTHY_SECONDS -ge $REQUIRED_HEALTHY_SECONDS ]; then
+              echo "Canary passed all checks for ${PROMOTION_WINDOW} continuous minutes"
+              echo "decision=promote" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+      - name: Promote canary to 100% traffic
+        if: steps.monitor.outputs.decision == 'promote'
+        run: |
+          az containerapp ingress traffic set \
+            --name ${{ steps.env.outputs.api_app }} \
+            --resource-group ${{ steps.env.outputs.resource_group }} \
+            --revision-weight \
+              "${{ steps.canary.outputs.revision }}=100"
+          
+          echo "Canary promoted to 100% traffic: ${{ steps.canary.outputs.revision }}"
+
+      - name: Rollback canary
+        if: steps.monitor.outputs.decision == 'rollback'
+        run: |
+          # Route 0% to canary, 100% to stable
+          az containerapp ingress traffic set \
+            --name ${{ steps.env.outputs.api_app }} \
+            --resource-group ${{ steps.env.outputs.resource_group }} \
+            --revision-weight \
+              "${{ steps.stable.outputs.revision }}=100" \
+              "${{ steps.canary.outputs.revision }}=0"
+          
+          echo "Canary rolled back. 100% traffic on stable: ${{ steps.stable.outputs.revision }}"
+          echo "Reason: ${{ steps.monitor.outputs.reason }}"
+
+      - name: Report rollback and notify
+        if: steps.monitor.outputs.decision == 'rollback'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ inputs.image_tag }}',
+              state: 'failure',
+              context: 'canary-deployment',
+              description: 'Canary deployment rolled back'
+            });
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Canary rollback: ${{ inputs.image_tag.substring(0, 8) }}`,
+              body: `## Canary Deployment Rollback\n\n` +
+                `**Image Tag:** ${{ inputs.image_tag }}\n` +
+                `**Environment:** ${{ inputs.environment }}\n` +
+                `**Canary Revision:** ${{ steps.canary.outputs.revision }}\n` +
+                `**Stable Revision:** ${{ steps.stable.outputs.revision }}\n` +
+                `**Reason:** ${{ steps.monitor.outputs.reason }}\n` +
+                `**Run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n` +
+                `The canary revision was rolled back due to failing health metrics. Traffic has been restored to the stable revision.`,
+              labels: ['canary-rollback', 'deployment-failure']
+            });
+
+      - name: Report successful promotion
+        if: steps.monitor.outputs.decision == 'promote'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ inputs.image_tag }}',
+              state: 'success',
+              context: 'canary-deployment',
+              description: 'Canary deployment promoted to 100%'
+            });

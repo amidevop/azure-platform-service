@@ -1,0 +1,351 @@
+name: Application Build & Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'infra/**'
+      - '*.md'
+      - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+  statuses: write
+  issues: write
+
+env:
+  DOTNET_VERSION: '8.0.x'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1: Build and Test
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore AzurePlatformService.sln
+
+      - name: Build application
+        run: dotnet build AzurePlatformService.sln -c Release --no-restore
+
+      - name: Run tests
+        run: dotnet test AzurePlatformService.sln -c Release --no-build --verbosity normal
+
+      - name: Set commit status to success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'success',
+              context: 'build-and-test',
+              description: 'Build and tests passed'
+            });
+
+      - name: Set commit status to failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'failure',
+              context: 'build-and-test',
+              description: 'Build or tests failed'
+            });
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: Build and Push Container Images
+  # ---------------------------------------------------------------------------
+  build-push-image:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to Azure Container Registry
+        run: az acr login --name ${{ secrets.ACR_LOGIN_SERVER }}
+
+      - name: Build API container image
+        run: |
+          docker build \
+            --target api \
+            --tag ${{ secrets.ACR_LOGIN_SERVER }}/api:${{ github.sha }} \
+            --tag ${{ secrets.ACR_LOGIN_SERVER }}/api:latest \
+            -f Dockerfile .
+
+      - name: Build Worker container image
+        run: |
+          docker build \
+            --target worker \
+            --tag ${{ secrets.ACR_LOGIN_SERVER }}/worker:${{ github.sha }} \
+            --tag ${{ secrets.ACR_LOGIN_SERVER }}/worker:latest \
+            -f Dockerfile .
+
+      - name: Push API container image
+        run: |
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/api:${{ github.sha }}
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/api:latest
+
+      - name: Push Worker container image
+        run: |
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/worker:${{ github.sha }}
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/worker:latest
+
+      - name: Set commit status to success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'success',
+              context: 'build-push-image',
+              description: 'Container images built and pushed successfully'
+            });
+
+      - name: Set commit status to failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'failure',
+              context: 'build-push-image',
+              description: 'Container image build or push failed'
+            });
+
+  # ---------------------------------------------------------------------------
+  # Stage 3: Deploy Application (Blue/Green)
+  # ---------------------------------------------------------------------------
+  deploy-app:
+    runs-on: ubuntu-latest
+    needs: build-push-image
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENV="${{ inputs.environment }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            ENV="prod"
+          else
+            ENV="dev"
+          fi
+          
+          echo "environment=$ENV" >> "$GITHUB_OUTPUT"
+          echo "resource_group=rg-azplat-${ENV}" >> "$GITHUB_OUTPUT"
+          echo "api_app=ca-azplat-api-${ENV}" >> "$GITHUB_OUTPUT"
+          echo "worker_app=ca-azplat-worker-${ENV}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get current active API revision
+        id: current-revision
+        run: |
+          CURRENT_REVISION=$(az containerapp revision list \
+            --name ${{ steps.env.outputs.api_app }} \
+            --resource-group ${{ steps.env.outputs.resource_group }} \
+            --query "[?properties.trafficWeight==\`100\`].name | [0]" \
+            --output tsv)
+          echo "revision=$CURRENT_REVISION" >> "$GITHUB_OUTPUT"
+          echo "Current active revision: $CURRENT_REVISION"
+
+      - name: Deploy new API revision with 0% traffic
+        id: new-revision
+        run: |
+          NEW_REVISION_SUFFIX="sha-${GITHUB_SHA:0:8}"
+          az containerapp update \
+            --name ${{ steps.env.outputs.api_app }} \
+            --resource-group ${{ steps.env.outputs.resource_group }} \
+            --image ${{ secrets.ACR_LOGIN_SERVER }}/api:${{ github.sha }} \
+            --revision-suffix "$NEW_REVISION_SUFFIX" \
+            --set-env-vars "DEPLOYMENT_SHA=${{ github.sha }}"
+          
+          NEW_REVISION="${{ steps.env.outputs.api_app }}--${NEW_REVISION_SUFFIX}"
+          echo "revision=$NEW_REVISION" >> "$GITHUB_OUTPUT"
+          echo "New revision deployed: $NEW_REVISION"
+          
+          # Set traffic to 0% for new revision, 100% for current
+          az containerapp ingress traffic set \
+            --name ${{ steps.env.outputs.api_app }} \
+            --resource-group ${{ steps.env.outputs.resource_group }} \
+            --revision-weight \
+              "${{ steps.current-revision.outputs.revision }}=100" \
+              "${NEW_REVISION}=0"
+
+      - name: Validate new revision readiness
+        id: health-check
+        run: |
+          NEW_REVISION="${{ steps.new-revision.outputs.revision }}"
+          API_APP="${{ steps.env.outputs.api_app }}"
+          RG="${{ steps.env.outputs.resource_group }}"
+          
+          # Get the app FQDN for health check
+          FQDN=$(az containerapp show \
+            --name "$API_APP" \
+            --resource-group "$RG" \
+            --query "properties.configuration.ingress.fqdn" \
+            --output tsv)
+          
+          HEALTH_URL="https://${FQDN}/health/ready"
+          CONSECUTIVE_SUCCESS=0
+          MAX_ATTEMPTS=30
+          ATTEMPT=0
+          
+          echo "Checking health at: $HEALTH_URL"
+          echo "Requiring 3 consecutive HTTP 200 responses at 10s intervals"
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "X-Revision: ${NEW_REVISION}" \
+              "$HEALTH_URL" || echo "000")
+            
+            if [ "$HTTP_STATUS" == "200" ]; then
+              CONSECUTIVE_SUCCESS=$((CONSECUTIVE_SUCCESS + 1))
+              echo "Attempt $ATTEMPT: HTTP $HTTP_STATUS (consecutive: $CONSECUTIVE_SUCCESS/3)"
+              if [ $CONSECUTIVE_SUCCESS -ge 3 ]; then
+                echo "Health check passed - 3 consecutive HTTP 200 responses"
+                echo "healthy=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            else
+              CONSECUTIVE_SUCCESS=0
+              echo "Attempt $ATTEMPT: HTTP $HTTP_STATUS (reset counter)"
+            fi
+            
+            sleep 10
+          done
+          
+          echo "Health check failed - did not achieve 3 consecutive HTTP 200 within timeout"
+          echo "healthy=false" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Shift 100% traffic to new revision
+        if: steps.health-check.outputs.healthy == 'true'
+        run: |
+          az containerapp ingress traffic set \
+            --name ${{ steps.env.outputs.api_app }} \
+            --resource-group ${{ steps.env.outputs.resource_group }} \
+            --revision-weight \
+              "${{ steps.new-revision.outputs.revision }}=100"
+          
+          echo "Traffic shifted 100% to new revision: ${{ steps.new-revision.outputs.revision }}"
+
+      - name: Rollback on health check failure
+        if: failure() && steps.new-revision.outputs.revision != ''
+        run: |
+          echo "Rolling back - deactivating new revision, retaining traffic on previous"
+          
+          # Restore 100% traffic to previous revision
+          az containerapp ingress traffic set \
+            --name ${{ steps.env.outputs.api_app }} \
+            --resource-group ${{ steps.env.outputs.resource_group }} \
+            --revision-weight \
+              "${{ steps.current-revision.outputs.revision }}=100"
+          
+          # Deactivate the failed revision
+          az containerapp revision deactivate \
+            --name ${{ steps.env.outputs.api_app }} \
+            --resource-group ${{ steps.env.outputs.resource_group }} \
+            --revision "${{ steps.new-revision.outputs.revision }}"
+          
+          echo "Rollback complete. Active revision: ${{ steps.current-revision.outputs.revision }}"
+
+      - name: Deploy Worker container
+        run: |
+          az containerapp update \
+            --name ${{ steps.env.outputs.worker_app }} \
+            --resource-group ${{ steps.env.outputs.resource_group }} \
+            --image ${{ secrets.ACR_LOGIN_SERVER }}/worker:${{ github.sha }}
+
+      - name: Set commit status to success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'success',
+              context: 'deploy-app',
+              description: 'Application deployment succeeded'
+            });
+
+      - name: Report deployment failure and notify
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'failure',
+              context: 'deploy-app',
+              description: 'Application deployment failed - rollback executed'
+            });
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Deployment rollback: ${context.sha.substring(0, 8)}`,
+              body: `## Deployment Failure\n\n` +
+                `**Commit:** ${context.sha}\n` +
+                `**Environment:** ${{ steps.env.outputs.environment }}\n` +
+                `**Branch:** ${context.ref}\n` +
+                `**Run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n` +
+                `The new revision failed health checks and traffic was rolled back to the previous revision.`,
+              labels: ['deployment-failure', 'rollback']
+            });
