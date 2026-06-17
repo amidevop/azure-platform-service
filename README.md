@@ -59,38 +59,49 @@ This is a **cloud-native work item processing platform** built on Azure. It demo
 ## Infrastructure Architecture
 
 ```mermaid
-graph TB
-    subgraph Azure_Subscription["Azure Subscription"]
-        subgraph Resource_Group["Resource Group: rg-azplat-env"]
-            subgraph Container_Apps["Container Apps Environment"]
-                API["API Service - min:1, max:10 replicas"]
-                Worker["Background Worker - min:0, max:10 replicas"]
-            end
+flowchart LR
+    Client(("👤 API Consumer"))
 
-            SB["Azure Service Bus - Queue + DLQ"]
-            ACR["Azure Container Registry"]
-            AI["Application Insights + Log Analytics"]
-            KV["Azure Key Vault"]
-            MI["User-Assigned Managed Identity"]
-            WB["Azure Monitor Workbook - Dashboard"]
+    subgraph CICD["⚙️ CI/CD Pipeline"]
+        GHA["GitHub Actions"]
+    end
+
+    subgraph AZ["☁️ Azure Cloud"]
+        ACR[("📦 Container\nRegistry")]
+
+        subgraph CAE["🖥️ Container Apps Environment"]
+            API["🌐 API Service\n.NET 8 Web API\nReplicas: 1-10"]
+            Worker["⚡ Background Worker\n.NET 8 Worker\nReplicas: 0-10"]
+        end
+
+        subgraph MSG["📨 Messaging"]
+            SB["Service Bus\nQueue"]
+            DLQ["Dead Letter\nQueue"]
+        end
+
+        subgraph OBS["📊 Observability"]
+            AI["Application\nInsights"]
+            DASH["Monitor\nWorkbook"]
+        end
+
+        subgraph SEC["🔒 Security"]
+            KV["Key Vault"]
+            MI["Managed\nIdentity"]
         end
     end
 
-    subgraph GitHub["GitHub"]
-        GHA["GitHub Actions CI/CD"]
-    end
-
-    API -- Send messages --> SB
-    Worker -- Receive messages --> SB
-    SB -- Failed messages --> SB
-    API -- Telemetry --> AI
-    Worker -- Telemetry --> AI
-    MI -- Authenticate --> SB
-    MI -- Authenticate --> KV
-    MI -- Pull images --> ACR
-    GHA -- Push images --> ACR
-    GHA -- Deploy infra --> Resource_Group
-    WB -- Query --> AI
+    Client -->|POST /api/work| API
+    Client -->|GET /api/work| API
+    API -->|Enqueue| SB
+    SB -->|Dequeue| Worker
+    SB -->|Failures| DLQ
+    API -->|Traces| AI
+    Worker -->|Traces| AI
+    AI -->|Queries| DASH
+    MI -.->|Auth| API
+    MI -.->|Auth| Worker
+    GHA -->|Push images| ACR
+    ACR -->|Pull| CAE
 ```
 
 ---
