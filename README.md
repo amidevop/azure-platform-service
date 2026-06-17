@@ -12,6 +12,7 @@
 - [Deployment Guide](#deployment-guide)
 - [Pipeline Architecture](#pipeline-architecture)
 - [Pipeline Requirements](#pipeline-requirements)
+- [Deployment Strategies](#deployment-strategies)
 - [Local Development](#local-development)
 - [API Endpoints](#api-endpoints)
 - [Design Decisions](#design-decisions)
@@ -607,6 +608,142 @@ The CI/CD is split into **three independent GitHub Actions workflows**:
 1. All Application Pipeline requirements
 2. Additional secrets: `APP_INSIGHTS_APP_ID`, `APP_INSIGHTS_API_KEY`
 3. Application already deployed (at least one stable revision running)
+
+---
+
+## Deployment Strategies
+
+This project implements two zero-downtime deployment strategies using Azure Container Apps' native revision management and traffic splitting.
+
+### Blue/Green Deployment (`app-deploy.yml` → `deploy-app` job)
+
+Blue/Green deployment ensures zero downtime by running two revisions simultaneously and switching traffic only after the new revision is validated.
+
+```mermaid
+sequenceDiagram
+    participant Pipeline as GitHub Actions
+    participant ACA as Container Apps
+    participant Health as /health/ready
+
+    Note over Pipeline,Health: Blue/Green Deployment Flow
+
+    Pipeline->>ACA: Deploy new revision (sha-abc123)
+    ACA->>ACA: New revision starts with 0% traffic
+    Note over ACA: Previous revision still at 100%
+
+    loop 3 consecutive checks at 10s intervals
+        Pipeline->>Health: GET /health/ready
+        Health-->>Pipeline: HTTP 200
+    end
+
+    alt All 3 checks pass
+        Pipeline->>ACA: Shift 100% traffic to new revision
+        Note over ACA: Previous revision scaled to zero
+        Pipeline->>Pipeline: Set commit status SUCCESS
+    else Health check fails within 5 minutes
+        Pipeline->>ACA: Keep 100% on previous revision
+        Pipeline->>ACA: Deactivate failed revision
+        Pipeline->>Pipeline: Set commit status FAILED
+        Pipeline->>Pipeline: Create GitHub Issue notification
+    end
+```
+
+**How it works step by step:**
+
+| Step | Action | Detail |
+|------|--------|--------|
+| 1 | **Deploy new revision** | `az containerapp update` creates a new revision with the latest image (tagged with commit SHA) |
+| 2 | **Set 0% traffic** | New revision exists but receives no traffic; previous revision still serves 100% |
+| 3 | **Health validation** | Pipeline calls `/health/ready` every 10 seconds, needs 3 consecutive HTTP 200 responses |
+| 4a | **Promote (success)** | `az containerapp ingress traffic set` shifts 100% to new revision |
+| 4b | **Rollback (failure)** | Traffic stays on previous revision; new revision is deactivated; GitHub issue created |
+| 5 | **Worker deploy** | Worker container updated directly (no traffic splitting needed — it's queue-based) |
+
+**Why Blue/Green:**
+- Zero downtime — traffic only shifts after validation
+- Instant rollback — previous revision is still running and ready
+- Safe for database-compatible changes — both revisions can coexist
+
+---
+
+### Canary Deployment (`canary-deploy.yml`)
+
+Canary deployment gradually shifts a small percentage of traffic to the new revision while continuously monitoring health metrics. It's used for high-risk deployments where you want real production traffic validation before full rollout.
+
+```mermaid
+sequenceDiagram
+    participant Operator as Platform Operator
+    participant Pipeline as GitHub Actions
+    participant ACA as Container Apps
+    participant AI as Application Insights
+
+    Note over Operator,AI: Canary Deployment Flow
+
+    Operator->>Pipeline: Trigger workflow_dispatch
+    Note over Operator: Inputs: environment, image_tag
+
+    Pipeline->>ACA: Deploy canary revision
+    Pipeline->>ACA: Route 10% canary, 90% stable
+
+    loop Every 30 seconds for up to 10 minutes
+        Pipeline->>AI: Query canary error rate
+        Pipeline->>AI: Query canary p95 latency
+        Pipeline->>AI: Query stable p95 latency
+
+        alt Error rate > 5% over 3 min with 50+ requests
+            Pipeline->>ACA: Route 0% to canary
+            Pipeline->>Pipeline: Create rollback issue
+            Note over ACA: Rollback complete
+        else Fewer than 50 requests in window
+            Note over Pipeline: Extend evaluation period
+        else Healthy for 10 continuous minutes
+            Pipeline->>ACA: Route 100% to canary
+            Note over ACA: Canary promoted
+        end
+    end
+```
+
+**How it works step by step:**
+
+| Step | Action | Detail |
+|------|--------|--------|
+| 1 | **Manual trigger** | Operator triggers via GitHub Actions UI with `environment` (dev/prod) and `image_tag` (commit SHA) |
+| 2 | **Deploy canary** | New revision created with a `canary-` suffix |
+| 3 | **Split traffic** | 10% routed to canary, 90% to stable revision |
+| 4 | **Monitor** | Every 30s, queries Application Insights for canary-specific metrics |
+| 5a | **Rollback** | If error rate > 5% (min 50 requests in 3-min window) → 0% to canary, GitHub issue created |
+| 5b | **Extend** | If fewer than 50 requests in evaluation window → keep monitoring until threshold met |
+| 5c | **Promote** | If error rate < 5% AND p95 ≤ 2× stable p95 for 10 continuous minutes → 100% to canary |
+
+**Monitoring criteria:**
+
+| Metric | Threshold | Action |
+|--------|-----------|--------|
+| Error rate (5xx/total) | > 5% over 3 minutes | **Rollback** immediately |
+| p95 latency | > 2× stable revision's p95 | Reset healthy counter (don't promote yet) |
+| Request count | < 50 in 3-min window | **Extend** evaluation (don't decide) |
+| All metrics healthy | Continuous 10 minutes | **Promote** to 100% |
+
+**When to use Canary vs Blue/Green:**
+
+| Scenario | Use |
+|----------|-----|
+| Standard deployment (most cases) | **Blue/Green** — automatic via `app-deploy.yml` on push to main |
+| High-risk change (major refactor, new dependency) | **Canary** — manual trigger via `canary-deploy.yml` |
+| Hotfix or rollback | **Blue/Green** — fast, validated within seconds |
+| Testing with real production traffic patterns | **Canary** — 10% traffic reveals load-dependent issues |
+
+**How to trigger a canary deployment:**
+
+```bash
+# Via GitHub CLI
+gh workflow run canary-deploy.yml \
+  -f environment=prod \
+  -f image_tag=abc1234567890def
+
+# Or via GitHub UI:
+# Actions → Canary Deployment → Run workflow → Select environment + enter image tag
+```
 
 ---
 
