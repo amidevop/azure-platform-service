@@ -60,37 +60,37 @@ This is a **cloud-native work item processing platform** built on Azure. It demo
 
 ```mermaid
 graph TB
-    subgraph "Azure Subscription"
-        subgraph "Resource Group: rg-azplat-{env}"
-            subgraph "Container Apps Environment"
-                API[API Service<br/>min:1 max:10 replicas<br/>CPU/HTTP scaling]
-                Worker[Background Worker<br/>min:0 max:10 replicas<br/>KEDA queue scaling]
+    subgraph Azure_Subscription["Azure Subscription"]
+        subgraph Resource_Group["Resource Group: rg-azplat-env"]
+            subgraph Container_Apps["Container Apps Environment"]
+                API["API Service - min:1, max:10 replicas"]
+                Worker["Background Worker - min:0, max:10 replicas"]
             end
 
-            SB[Azure Service Bus<br/>Namespace + Queue + DLQ]
-            ACR[Azure Container Registry]
-            AI[Application Insights<br/>+ Log Analytics Workspace]
-            KV[Azure Key Vault]
-            MI[User-Assigned<br/>Managed Identity]
-            WB[Azure Monitor Workbook<br/>Dashboard]
+            SB["Azure Service Bus - Queue + DLQ"]
+            ACR["Azure Container Registry"]
+            AI["Application Insights + Log Analytics"]
+            KV["Azure Key Vault"]
+            MI["User-Assigned Managed Identity"]
+            WB["Azure Monitor Workbook - Dashboard"]
         end
     end
 
-    subgraph "GitHub"
-        GHA[GitHub Actions<br/>CI/CD Pipelines]
+    subgraph GitHub["GitHub"]
+        GHA["GitHub Actions CI/CD"]
     end
 
-    API -->|Send messages| SB
-    Worker -->|Receive messages| SB
-    SB -->|Failed messages| SB
-    API -->|Telemetry| AI
-    Worker -->|Telemetry| AI
-    MI -->|Authenticate| SB
-    MI -->|Authenticate| KV
-    MI -->|Pull images| ACR
-    GHA -->|Push images| ACR
-    GHA -->|Deploy infra| Resource Group
-    WB -->|Query| AI
+    API -- Send messages --> SB
+    Worker -- Receive messages --> SB
+    SB -- Failed messages --> SB
+    API -- Telemetry --> AI
+    Worker -- Telemetry --> AI
+    MI -- Authenticate --> SB
+    MI -- Authenticate --> KV
+    MI -- Pull images --> ACR
+    GHA -- Push images --> ACR
+    GHA -- Deploy infra --> Resource_Group
+    WB -- Query --> AI
 ```
 
 ---
