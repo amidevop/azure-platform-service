@@ -4,6 +4,7 @@
 
 - [Use Case](#use-case)
 - [How It Works](#how-it-works)
+- [Application Architecture](#application-architecture)
 - [Infrastructure Architecture](#infrastructure-architecture)
 - [Azure Components](#azure-components)
 - [Prerequisites for Deployment](#prerequisites-for-deployment)
@@ -53,6 +54,162 @@ This is a **cloud-native work item processing platform** built on Azure. It demo
 3. **Worker dequeues and processes** → Extracts trace context, processes item, stores result
 4. **Client retrieves results** → `GET /api/work` returns processed items (most recent first, max 100)
 5. **Failures are handled gracefully** → Transient errors retry with exponential backoff (2s, 4s, 8s); non-transient errors dead-letter immediately
+
+---
+
+## Application Architecture
+
+### Technology Stack
+
+| Layer | Technology | Version |
+|-------|-----------|---------|
+| Runtime | .NET | 8.0 (LTS) |
+| Language | C# | 12 |
+| API Framework | ASP.NET Core | 8.0 |
+| Worker Framework | .NET Worker Service | 8.0 |
+| Messaging SDK | Azure.Messaging.ServiceBus | 7.17.5 |
+| Authentication | Azure.Identity (DefaultAzureCredential) | 1.11.4 |
+| Tracing | OpenTelemetry SDK + Azure Monitor Exporter | 1.9.0 |
+| Container | Docker (multi-stage build) | 20.10+ |
+| Testing | xUnit + FsCheck (property-based) + FluentAssertions | Latest |
+
+### Application Components
+
+```mermaid
+flowchart TD
+    subgraph API["🌐 API Service - src/Api"]
+        HC["HealthController\n/health/live, /health/ready"]
+        WC["WorkController\n/api/work"]
+        CB["CircuitBreakerService\n5 failures → open"]
+        MP["ServiceBusMessagePublisher\nTrace context propagation"]
+        SBH["ServiceBusHealthCheck"]
+        AIH["AppInsightsHealthCheck"]
+        OTM["OpenTelemetry Middleware\nSpan recording + error tracking"]
+    end
+
+    subgraph Worker["⚡ Worker Service - src/Worker"]
+        WS["WorkerService\nMessage processor"]
+        RP["ExponentialBackoffRetryPolicy\n2s, 4s, 8s delays"]
+        TC["Trace Context Extraction\nW3C traceparent parsing"]
+    end
+
+    subgraph Shared["📦 Shared - src/Shared"]
+        WI["WorkItem model"]
+        WIM["WorkItemMessage model"]
+        IWS["IWorkItemStore interface"]
+        IMP["IMessagePublisher interface"]
+    end
+
+    WC --> CB --> MP
+    WS --> RP
+    WS --> TC
+    API --> Shared
+    Worker --> Shared
+```
+
+### API Service (`src/Api`)
+
+The API is an ASP.NET Core 8 Web API with the following capabilities:
+
+| Component | Purpose |
+|-----------|---------|
+| **HealthController** | Liveness (`/health/live`) and readiness (`/health/ready`) probes for orchestrator health management |
+| **WorkController** | `POST /api/work` to submit items, `GET /api/work` to retrieve processed results |
+| **CircuitBreakerService** | Protects against Service Bus failures — opens after 5 consecutive failures in 60s, half-open probe after 30s |
+| **ServiceBusMessagePublisher** | Publishes messages with W3C trace context (`traceparent`) for distributed tracing |
+| **OpenTelemetry Middleware** | Records spans with method, route, status code; sets error status with exception type on failures |
+| **AuthenticationFailureMiddleware** | Returns 503 within 5 seconds on Managed Identity auth failures |
+
+**Resilience pattern:**
+```
+Request → CircuitBreaker → ServiceBus
+              │
+              ├─ Closed: allow request
+              ├─ Open (5 failures/60s): reject immediately → 503
+              └─ HalfOpen (after 30s): probe with single request
+                    ├─ Success → Close circuit
+                    └─ Failure → Re-open circuit
+```
+
+### Background Worker (`src/Worker`)
+
+The Worker is a .NET 8 BackgroundService that processes messages from the Service Bus queue:
+
+| Component | Purpose |
+|-----------|---------|
+| **WorkerService** | Dequeues messages, extracts trace context, processes items, stores results |
+| **ExponentialBackoffRetryPolicy** | Computes retry delays: `baseDelay × multiplier^(attempt-1)` → 2s, 4s, 8s |
+| **Trace Context Handling** | Extracts `traceparent` from message properties; creates root span if missing/malformed |
+| **Error Classification** | Transient errors (timeout, network) → retry; Non-transient (bad payload) → dead-letter immediately |
+
+**Message processing flow:**
+```
+Dequeue → Extract Trace Context → Process
+                                      │
+                    ┌─────────────────┼─────────────────┐
+                    │                 │                 │
+                 Success        Transient Error    Non-Transient Error
+                    │                 │                 │
+              Store Result     Retry (max 3)      Dead-Letter
+              Complete Msg         │              Immediately
+                              ┌────┴────┐
+                              │         │
+                           Success   Exhausted
+                              │         │
+                        Store Result  Dead-Letter
+```
+
+### Shared Library (`src/Shared`)
+
+Common models and interfaces used by both API and Worker:
+
+| Model/Interface | Description |
+|-----------------|-------------|
+| `WorkItem` | Record with Id, Payload, ProcessedAt, Status, ErrorMessage |
+| `WorkItemMessage` | Service Bus message envelope with WorkItemId, Payload, EnqueuedAt, AttemptCount |
+| `WorkItemRequest` | POST request body with validated Payload field |
+| `WorkItemStatus` | Enum: Pending, Processing, Completed, Failed |
+| `HealthCheckResponse` | Health endpoint response with Status and Dependencies list |
+| `CircuitBreakerState` | Circuit state snapshot (State, ConsecutiveFailures, timestamps) |
+| `IWorkItemStore` | Interface for storing/retrieving processed work items |
+| `IMessagePublisher` | Interface for publishing messages to Service Bus |
+
+### Containerization
+
+The application uses a **multi-stage Dockerfile** with separate build targets:
+
+```dockerfile
+# Build stage (shared)
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+# ... restore, build ...
+
+# API runtime (target: api)
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS api
+EXPOSE 8080
+ENTRYPOINT ["dotnet", "AzurePlatformService.Api.dll"]
+
+# Worker runtime (target: worker)
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS worker
+ENTRYPOINT ["dotnet", "AzurePlatformService.Worker.dll"]
+```
+
+Build specific targets:
+```bash
+docker build --target api -t myregistry/api:latest .
+docker build --target worker -t myregistry/worker:latest .
+```
+
+### Observability
+
+| Feature | Implementation |
+|---------|---------------|
+| **Distributed Tracing** | OpenTelemetry SDK with W3C Trace Context propagation through Service Bus |
+| **Span Attributes** | HTTP method, route, status code, trace ID, span ID, parent span ID |
+| **Error Recording** | Span status set to Error with exception type attribute |
+| **Correlation** | Same trace ID in API request → Service Bus message → Worker processing |
+| **Metrics** | Request rate, error rate, processing duration sent to Application Insights |
+| **Dashboard** | Azure Monitor Workbook with API metrics, Worker metrics, and queue depth |
+| **Alerting** | Alert fires when 5xx rate exceeds 5% over 5 minutes (minimum 20 requests) |
 
 ---
 
